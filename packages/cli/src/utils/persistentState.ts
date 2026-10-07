@@ -7,6 +7,7 @@
 import { Storage, debugLogger } from '@google/gemini-cli-core';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 const STATE_FILENAME = 'state.json';
 
@@ -39,29 +40,59 @@ export class PersistentState {
       const filePath = this.getPath();
       if (fs.existsSync(filePath)) {
         const content = fs.readFileSync(filePath, 'utf-8');
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-        this.cache = JSON.parse(content);
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+          this.cache = JSON.parse(content);
+        } catch (parseError) {
+          debugLogger.warn(
+            'Failed to parse persistent state, preserving corrupt copy:',
+            parseError,
+          );
+          this.preserveCorruptFile(filePath);
+          this.cache = {};
+        }
       } else {
         this.cache = {};
       }
     } catch (error) {
       debugLogger.warn('Failed to load persistent state:', error);
-      // If error reading (e.g. corrupt JSON), start fresh
+      // If error reading (e.g. permission error), start fresh
       this.cache = {};
     }
     return this.cache!;
   }
 
+  // Best-effort forensics: a truncated/corrupt state.json otherwise gets
+  // silently overwritten by the next `{}` reset, losing the evidence.
+  private preserveCorruptFile(filePath: string): void {
+    try {
+      fs.renameSync(filePath, `${filePath}.corrupt.${Date.now()}`);
+    } catch {
+      // Ignore — e.g. file already moved or gone.
+    }
+  }
+
   private save() {
     if (!this.cache) return;
+    const filePath = this.getPath();
+    // Write-then-rename so a kill/power-loss mid-write can't leave a
+    // truncated state.json behind (renameSync is atomic within a filesystem).
+    const tempPath = `${filePath}.tmp.${crypto.randomUUID()}`;
     try {
-      const filePath = this.getPath();
       const dir = path.dirname(filePath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(filePath, JSON.stringify(this.cache, null, 2));
+      fs.writeFileSync(tempPath, JSON.stringify(this.cache, null, 2));
+      fs.renameSync(tempPath, filePath);
     } catch (error) {
+      if (fs.existsSync(tempPath)) {
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {
+          // Ignore cleanup errors.
+        }
+      }
       debugLogger.warn('Failed to save persistent state:', error);
     }
   }
